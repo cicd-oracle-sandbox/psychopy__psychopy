@@ -1,0 +1,4 @@
+upstream: https://github.com/psychopy/psychopy
+commit: 6fdd52c85ae3f053a0a1938a6a4039daa48c9b88
+license: GPL-3.0
+Unmodified snapshot except that .github/workflows was emptied.

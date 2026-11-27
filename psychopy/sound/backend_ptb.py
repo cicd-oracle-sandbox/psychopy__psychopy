@@ -1,0 +1,505 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+New backend for the Psychtoolbox portaudio engine
+"""
+import sys
+import os
+import time
+import re
+import weakref
+from pathlib import Path
+
+from psychopy import prefs, logging, exceptions
+from psychopy.constants import (STARTED, PAUSED, FINISHED, STOPPING,
+                                NOT_STARTED)
+from psychopy.hardware.speaker.speaker_psychtoolbox import \
+    PsychtoolboxSpeakerDevice
+from psychopy.tools import systemtools
+from psychopy.tools import filetools as ft
+from .exceptions import SoundFormatError, DependencyError
+from ._base import _SoundBase, HammingWindow
+from .audioclip import AudioClip
+from ..hardware import DeviceManager
+
+try:
+    from psychtoolbox import audio
+    import psychtoolbox as ptb
+except ImportError as err:
+    raise DependencyError(
+        "psychtoolbox audio failed to import: {}".format(
+            systemtools.describePsychtoolboxImportError(err))) from err
+except Exception as err:
+    raise DependencyError("psychtoolbox audio failed to import") from err
+try:
+    import soundfile as sf
+except Exception:
+    raise DependencyError("soundfile not working")
+
+import numpy as np
+
+__all__ = [
+    "SoundPTB",
+    "Sound"
+]
+
+
+defaultLatencyClass = 1
+# suggestedLatency = 0.005  ## Not currently used. Keep < 1 scr refresh
+
+if prefs.hardware['audioDriver']=='auto':
+    audioDriver = None
+else:
+    audioDriver = prefs.hardware['audioDriver']
+
+if prefs.hardware['audioDevice']=='auto':
+    audioDevice = None
+else:
+    audioDevice = prefs.hardware['audioDevice']
+
+# check if we should only use WAS host API (default is True on Windows)
+audioWASAPIOnly = False
+try:
+    wasapiPref = prefs.hardware['audioWASAPIOnly']
+except KeyError:
+    wasapiPref = False
+if sys.platform == 'win32' and wasapiPref:
+    audioWASAPIOnly = True
+
+# these will be used by sound.__init__.py
+defaultInput = None
+defaultOutput = audioDevice
+
+logging.info("Loaded psychtoolbox audio version {}"
+             .format(audio.get_version_info()['version']))
+
+# ask PTB to align verbosity with our current logging level at console
+_verbosities = ((logging.DEBUG, 5),
+                (logging.INFO, 4),
+                (logging.EXP, 3),
+                (logging.WARNING, 2),
+                (logging.ERROR, 1))
+
+for _logLevel, _verbos in _verbosities:
+    if logging.console.level <= _logLevel:
+        audio.verbosity(_verbos)
+        break
+
+
+def init(rate=48000, stereo=True, buffer=128):
+    pass  # for compatibility with other backends
+
+
+class SoundPTB(_SoundBase):
+    """Play a variety of sounds using the new PsychPortAudio library
+    """
+
+    def __init__(self, value="C", secs=0.5, octave=4, stereo=-1,
+                 volume=1.0, loops=0,
+                 sampleRate=None, blockSize=128,
+                 preBuffer=-1,
+                 hamming=True,
+                 startTime=0, stopTime=-1,
+                 name='', autoLog=True,
+                 syncToWin=None, speaker=None):
+        """
+        :param value: note name ("C","Bfl"), filename or frequency (Hz)
+        :param secs: duration (for synthesised tones)
+        :param octave: which octave to use for note names (4 is middle)
+        :param stereo: -1 (auto), True or False
+                        to force sounds to stereo or mono
+        :param volume: float 0-1
+        :param loops: number of loops to play (-1=forever, 0=single repeat)
+        :param sampleRate: sample rate for synthesized tones
+        :param blockSize: the size of the buffer on the sound card
+                         (small for low latency, large for stability)
+        :param preBuffer: integer to control streaming/buffering
+                           - -1 means store all
+                           - 0 (no buffer) means stream from disk
+                           - potentially we could buffer a few secs(!?)
+        :param hamming: boolean (default True) to indicate if the sound should
+                        be apodized (i.e., the onset and offset smoothly ramped up from
+                        down to zero). The function apodize uses a Hanning window, but
+                        arguments named 'hamming' are preserved so that existing code
+                        is not broken by the change from Hamming to Hanning internally.
+                        Not applied to sounds from files.
+        :param startTime: for sound files this controls the start of snippet
+        :param stopTime: for sound files this controls the end of snippet
+        :param name: string for logging purposes
+        :param autoLog: whether to automatically log every change
+        :param syncToWin: if you want start/stop to sync with win flips add this
+        """
+        # if given the name of a managed speaker, get it
+        if isinstance(speaker, str) and DeviceManager.getDevice(speaker):
+            speaker = DeviceManager.getDevice(speaker)
+        # make sure speaker is a psychtoolbox speaker, whatever the audioLib pref
+        speaker = PsychtoolboxSpeakerDevice._fromSpeaker(speaker)
+        self.speaker = speaker
+        
+        self.sound = value
+        self.name = name
+        self.secs = secs  # for any synthesised sounds (notesand freqs)
+        self.octave = octave  # for note name sounds
+        self.loops = self._loopsRequested = loops
+        self._loopsFinished = 0
+        self.volume = volume
+        self.startTime = startTime  # for files
+        self.stopTime = stopTime  # for files specify thesection to be played
+        self.blockSize = blockSize  # can be per-sound unlike other backends
+        self.preBuffer = preBuffer
+        self.frameN = 0
+        self._tSoundRequestPlay = 0
+        self.sampleRate = sampleRate
+        self.channels = None  # let this be set by stereo
+        self.stereo = stereo
+        self.duplex = None
+        self.autoLog = autoLog
+        self.sourceType = 'unknown'  # set to be file, array or freq
+        self.sndFile = None
+        self.sndArr = None
+        self.hamming = hamming
+        self._hammingWindow = None  # will be created during setSound
+        self.win = syncToWin
+        # set before `setSound`, which seeks to the start of the new sound
+        self._isPlaying = False  # set `True` after `play()` is called
+        # whether `play()` carries on from where the sound was paused
+        self._resumeOnPlay = False
+        self._repetitions = None  # as last passed to the track by `play()`
+        # setSound (determines sound type)
+        self.setSound(value, secs=self.secs, octave=self.octave,
+                      hamming=self.hamming)
+        self._isFinished = False
+        self.status = NOT_STARTED
+
+    @property
+    def isPlaying(self):
+        """`True` if the audio playback is ongoing."""
+        # This will update _isPlaying if sound has stopped by _EOS()
+        _ = self._checkPlaybackFinished()
+        return self._isPlaying
+
+    @property
+    def isFinished(self):
+        """`True` if the audio playback has completed."""
+        return self._checkPlaybackFinished()
+
+    @property
+    def statusDetailed(self):
+        if not self.track:
+            return None
+        return self.track.status
+
+    @property
+    def volume(self):
+        return self.__dict__['volume']
+
+    @volume.setter
+    def volume(self, newVolume):
+        self.__dict__['volume'] = newVolume
+        if 'track' in self.__dict__:
+            # Update volume of an existing track, if it exists.
+            # (BUGFIX, otherwise only the member variable is updated, but the sound
+            # volume does not change while playing - Suddha Sourav, 14.10.2020)
+            self.__dict__['track']().volume = newVolume
+        else:
+            return None
+
+    @property
+    def stereo(self):
+        return self.__dict__['stereo']
+
+    @stereo.setter
+    def stereo(self, val):
+        # if auto, get from speaker
+        if val == -1:
+            val = self.speaker.channels > 1
+        # store value
+        self.__dict__['stereo'] = val
+        # convert to n channels
+        if val is True:
+            self.__dict__['channels'] = 2
+        elif val is False:
+            self.__dict__['channels'] = 1
+        elif val == -1:
+            self.__dict__['channels'] = -1
+
+    def setSound(self, value, secs=0.5, octave=4, hamming=None, log=True):
+        """Set the sound to be played.
+
+        Often this is not needed by the user - it is called implicitly during
+        initialisation.
+
+        :parameters:
+
+            value: can be a number, string or an array:
+                * If it's a number between 37 and 32767 then a tone will
+                  be generated at that frequency in Hz.
+                * It could be a string for a note ('A', 'Bfl', 'B', 'C',
+                  'Csh'. ...). Then you may want to specify which octave.
+                * Or a string could represent a filename in the current
+                  location, or mediaLocation, or a full path combo
+                * Or by giving an Nx2 numpy array of floats (-1:1) you can
+                  specify the sound yourself as a waveform
+
+            secs: duration (only relevant if the value is a note name or
+                a frequency value)
+
+            octave: is only relevant if the value is a note name.
+                Middle octave of a piano is 4. Most computers won't
+                output sounds in the bottom octave (1) and the top
+                octave (8) is generally painful
+        """
+        # reset self.loops to what was requested (in case altered for infinite play of tones)
+        self.loops = self._loopsRequested
+        # start with the base class method
+        _SoundBase.setSound(self, value, secs, octave, hamming, log)
+    
+    def _setSndFromClip(self, clip: AudioClip):
+        # store clip
+        self.clip = clip
+        # work out stop time
+        if self.stopTime == -1:
+            self.duration = clip.samples.shape[0] / clip.sampleRateHz
+        # handle stereo/mono
+        if self.speaker.channels > 1:
+            clip = clip.asStereo()
+        else:
+            clip = clip.asMono()
+        # if the speaker has no stream yet, create one with as many channels as the clip
+        self.speaker.open(channels=clip.channels)
+        # resample the clip if needed and allowed
+        if self.speaker.resample:
+            if clip.sampleRateHz != self.speaker.sampleRateHz:
+                clip.resample(targetSampleRateHz=self.speaker.sampleRateHz)
+        # if the stream was already created with more channels, pad with silent channels
+        samples = clip.samples
+        if self.speaker.channels > samples.shape[1]:
+            samples = np.pad(samples, ((0, 0), (0, self.speaker.channels - samples.shape[1])))
+        # create/update track
+        if  self.track:
+            self.track.stop()
+            # so the seek below doesn't start the new sound playing
+            self._isPlaying = False
+            self.track.fill_buffer(samples)
+        else:
+            self.track = audio.Slave(
+                self.stream.handle,
+                data=samples,
+                volume=self.volume,
+                mode=1
+            )
+        # plays to the end of the buffer, see `_trimSamples`
+        self._playEnd = None
+        # seek to start
+        self.seek(0)
+
+    def _toStreamSamples(self, samples):
+        """Map samples to the channels of the speaker's stream, as
+        `_setSndFromClip` does a whole clip."""
+        clip = AudioClip(samples, sampleRateHz=self.sampleRate)
+        if self.speaker.channels > 1:
+            clip = clip.asStereo()
+        else:
+            clip = clip.asMono()
+        samples = clip.samples
+        if self.speaker.channels > samples.shape[1]:
+            samples = np.pad(
+                samples, ((0, 0), (0, self.speaker.channels - samples.shape[1])))
+
+        return samples
+
+    def _writeSamples(self, start, samples):
+        # Also written into PTB's buffer, which was made at full length by
+        # `_allocateSamples`. Writing it a block at a time like this holds the
+        # GIL for a millisecond or so a block, where filling it in one go
+        # holds it for ~0.15 ms per second of audio, holding up drawing.
+        nWritten = _SoundBase._writeSamples(self, start, samples)
+        track = self.track
+        if nWritten and track is not None:
+            block = self._toStreamSamples(self.sndArr[start:start + nWritten])
+            audio.PsychPortAudio(
+                'RefillBuffer', track.handle, 0,
+                np.ascontiguousarray(block, dtype=np.float32), start)
+
+        return nWritten
+
+    def _trimSamples(self, nSamples):
+        _SoundBase._trimSamples(self, nSamples)
+        self.clip = AudioClip(
+            self.sndArr, sampleRateHz=self.sampleRate, copy=False)
+        # PTB's buffer keeps its length, so stop playback where the sound ends
+        self._playEnd = self.duration
+        self.seek(self.t)
+
+    def _channelCheck(self, array):
+        """Checks whether stream has fewer channels than data. If True, ValueError"""
+        if self.channels < array.shape[1]:
+            msg = (
+                "The sound stream is set up incorrectly. You have fewer channels in the buffer "
+                "than in data file ({} vs {}).\n**Ensure you have selected 'Force stereo' in "
+                "experiment settings**".format(self.channels, array.shape[1]))
+            logging.error(msg)
+            raise ValueError(msg)
+
+    def _checkPlaybackFinished(self):
+        """Checks whether playback has finished by looking up the status.
+        """
+        # get detailed status from backend
+        pa_status = self.statusDetailed
+        # was the sound already finished?
+        wasFinished = self._isFinished
+        # is it finished now?
+        isFinished = self._isFinished = not pa_status['Active'] and pa_status['State'] == 0
+        # if it wasn't finished but now is, do end of stream behaviour
+        if isFinished and not wasFinished:
+            self._EOS()
+
+        return self._isFinished
+
+    def play(self, loops=None, when=None, log=True):
+        """Start the sound playing.
+
+        Calling this after the sound has finished playing will restart the
+        sound.
+
+        `when` is when to start playback: an absolute time in seconds on the
+        clock `psychopy.clock.getTime()` reads, or a `psychopy.visual.Window`
+        to start on its next flip. If `None`, playback starts on the next flip of
+        the window given as `syncToWin`, or immediately without one. A time
+        which has already passed starts playback immediately.
+
+        """
+        # A paused track looks the same as a finished one to PTB, so only check
+        # for the end when not about to carry on from a pause.
+        if not self._resumeOnPlay and self._checkPlaybackFinished():
+            self.stop(reset=True)
+
+        if loops is not None and self.loops != loops:
+            self.setLoops(loops)
+
+        self._tSoundRequestPlay = time.time()
+
+        if hasattr(when, 'getFutureFlipTime'):
+            logTime = when.getFutureFlipTime(clock=None)
+            when = when.getFutureFlipTime(clock='ptb')
+        elif when is None and hasattr(self.win, 'getFutureFlipTime'):
+            logTime = self.win.getFutureFlipTime(clock=None)
+            when = self.win.getFutureFlipTime(clock='ptb')
+        else:
+            logTime = None
+        self._repetitions = loops
+        self.track.start(
+            repetitions=loops, when=when, resume=int(self._resumeOnPlay))
+        self._resumeOnPlay = False
+        self._isPlaying = True
+        self._isFinished = False
+        # time.sleep(0.)
+        if log and self.autoLog:
+            logging.exp(u"Playing sound %s on speaker %s" % (self.name, self.speaker.name), obj=self, t=logTime)
+
+    def pause(self, log=True):
+        """Stops the sound without reset, so that play will continue from here if needed
+        """
+        if self._isPlaying:
+            self.stop(reset=False, log=False)
+            self._resumeOnPlay = True
+            if log and self.autoLog:
+                logging.exp(u"Sound %s paused" % (self.name), obj=self)
+
+    def stop(self, reset=True, log=True):
+        """Stop the sound and return to beginning
+        """
+        # this uses FINISHED for some reason, all others use STOPPED
+        if not self._isPlaying:
+            return
+
+        # track is a weak reference, so may already be gone (e.g. during interpreter shutdown)
+        if self.track is not None:
+            self.track.stop()
+        self._isPlaying = False
+
+        if reset:
+            self.seek(0)
+        if log and self.autoLog:
+            logging.exp(u"Sound %s stopped" % (self.name), obj=self)
+
+    def seek(self, t):
+        """Move playback to `t` seconds into the sound, carrying on playing
+        from there if the sound is playing."""
+        self.t = t
+        self.frameN = int(round(t * self.sampleRate))
+        if self.sndFile and not self.sndFile.closed:
+            self.sndFile.seek(self.frameN)
+        self._isFinished = t >= self.duration
+
+        track = self.track
+        if track is None:
+            return
+
+        # play from `t` next, rather than from wherever it was paused
+        self._resumeOnPlay = False
+
+        wasPlaying = self._isPlaying
+        if wasPlaying:
+            track.stop()
+
+        # PTB can only start a track from the start of its loop range, so move
+        # that to `t` (refilling the buffer resets it to the whole sound).
+        # Seeking to the end leaves a sample or two to play, since the range
+        # can't be empty, and lets the sound finish as normal.
+        if self.clip is not None:
+            t = min(t, self.clip.duration - 2.0 / self.speaker.sampleRateHz)
+        audio.PsychPortAudio(
+            'SetLoop', track.handle, max(0.0, t),
+            getattr(self, '_playEnd', None), 1)
+
+        if wasPlaying:
+            track.start(repetitions=self._repetitions)
+            # it finishes (and ends as usual) once what's left has played
+            self._isFinished = False
+
+    def _EOS(self, reset=True, log=True):
+        """Function called on End Of Stream
+        """
+        self._loopsFinished += 1
+        if self._loopsFinished >= self._loopsRequested:
+            # if we have finished all requested loops
+            self.stop(reset=reset, log=False)
+        else:
+            # reset _isFinished back to False
+            self._isFinished = False
+
+        if log and self.autoLog:
+            logging.exp(u"Sound %s reached end of file" % self.name, obj=self)
+
+    @property
+    def stream(self):
+        """Read-only property returns the stream on which the sound
+        will be played
+        """
+        return self.speaker.stream
+
+    def __del__(self):
+        if self.track:
+            self.track.close()
+        self.track = None
+
+    @property
+    def track(self):
+        """The track on the master stream to which we belong"""
+        # the track is actually a weak reference to avoid circularity
+        if 'track' in self.__dict__:
+            return self.__dict__['track']()
+        else:
+            return None
+
+    @track.setter
+    def track(self, track):
+        if track is None:
+            self.__dict__['track'] = None
+        else:
+            self.__dict__['track'] = weakref.ref(track)
+
+
+Sound = SoundPTB

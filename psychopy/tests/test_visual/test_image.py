@@ -1,0 +1,367 @@
+from pathlib import Path
+
+from psychopy import visual, colors, core
+from .test_basevisual import _TestUnitsMixin, _TestSerializationMixin
+from psychopy.tests.test_experiment.test_component_compile_python import _TestBoilerplateMixin
+from psychopy.tests import utils
+import pytest
+
+class TestImage(_TestUnitsMixin, _TestBoilerplateMixin, _TestSerializationMixin):
+    """
+    Test that images render as expected. Note: In BaseVisual tests, image colors will look different than
+    seems intuitive as foreColor will be set to `"blue"`.
+    """
+    def setup_method(self, method):
+        # name the window after the test, so it's clear which one is running
+        self.win = visual.Window(
+            title=f"{type(self).__name__}::{method.__name__}")
+        self.obj = visual.ImageStim(
+            self.win,
+            str(Path(utils.TESTS_DATA_PATH) / 'testimage.jpg'),
+            colorSpace='rgb1',
+        )
+
+    def teardown_method(self):
+        self.win.close()
+
+    def test_anchor_flip(self):
+        """
+        Check that flipping the image doesn't flip the direction of the anchor
+        """
+        # Setup obj
+        self.obj.units = "height"
+        self.obj.pos = (0, 0)
+        self.obj.size = (0.5, 0.5)
+        self.obj.anchor = "bottom left"
+        # Flip vertically
+        self.obj.flipVert = True
+        self.obj.flipHoriz = False
+        # Check
+        self.win.flip()
+        self.obj.draw()
+        # self.win.getMovieFrame(buffer='back').save(Path(utils.TESTS_DATA_PATH) / "test_image_flip_anchor_vert.png")
+        utils.compareScreenshot("test_image_flip_anchor_vert.png", self.win, crit=7)
+        # Flip horizontally
+        self.obj.flipVert = False
+        self.obj.flipHoriz = True
+        # Check
+        self.win.flip()
+        self.obj.draw()
+        # self.win.getMovieFrame(buffer='back').save(Path(utils.TESTS_DATA_PATH) / "test_image_flip_anchor_horiz.png")
+        utils.compareScreenshot("test_image_flip_anchor_horiz.png", self.win, crit=7)
+
+    def test_image_data(self):
+        """
+        Check that texture memory can be read and written through `.imageData`
+        """
+        import numpy as np
+
+        # texture of a known size and value so changes are easy to spot
+        self.obj.image = np.zeros((16, 32, 3), dtype=float)
+
+        imageData = self.obj.imageData
+        assert imageData is not None
+        assert imageData.shape == (16, 32, 3)
+        assert np.abs(imageData).max() == 0
+
+        # the same mapping comes back until it is released, whether it's
+        # reached through the property or the method behind it
+        assert self.obj.imageData is imageData
+        assert self.obj.mapImageData() is imageData
+
+        # mapping and unmapping explicitly round-trips the same way
+        assert self.obj.unmapImageData() is True
+        assert self.obj.unmapImageData() is False  # nothing left mapped
+        remapped = self.obj.mapImageData()
+        assert remapped is not imageData
+        assert remapped.shape == (16, 32, 3)
+        imageData = remapped
+
+        # writes survive being pushed to the texture and read back
+        imageData[4:8, :, 1] = 1.
+        self.obj.draw()
+        self.win.flip()
+        readback = self.obj.imageData
+        assert readback is not imageData
+        assert (readback[4:8, :, 1] == 1.).all()
+        assert (readback[8:, :, 1] == 0.).all()
+
+        # assigning to the property writes the whole array through
+        self.obj.imageData = np.ones((16, 32, 3), dtype=np.float32) * 0.5
+        assert (self.obj.imageData == 0.5).all()
+
+        # the mask has its own storage, it mustn't overwrite the image
+        self.obj.mask = "gauss"
+        assert self.obj.imageData.shape == (16, 32, 3)
+        assert (self.obj.imageData == 0.5).all()
+        self.obj.mask = None
+
+        # a new image replaces the mapping rather than reusing the old one
+        self.obj.image = str(Path(utils.TESTS_DATA_PATH) / 'testimage.jpg')
+        assert self.obj.imageData.shape[:2] != (16, 32)
+
+        # nothing to map when there's no texture of our own
+        self.obj.image = None
+        assert self.obj.imageData is None
+        assert self.obj.mapImageData() is None
+        with pytest.raises(AttributeError):
+            self.obj.imageData = np.zeros((16, 32, 3))
+
+    def test_mask_data(self):
+        """
+        Check that mask texture memory can be read and written through
+        `.maskData`
+        """
+        import numpy as np
+
+        self.obj.image = np.zeros((16, 32, 3), dtype=float)
+        self.obj.texRes = 64
+        self.obj.mask = "circle"
+
+        maskData = self.obj.maskData
+        assert maskData is not None
+        assert maskData.shape == (64, 64)
+        assert maskData.dtype == np.uint8
+        # a circle is opaque in the middle and transparent in the corners
+        assert maskData[32, 32] == 255
+        assert maskData[0, 0] == 0
+
+        # the same mapping comes back until it is released
+        assert self.obj.maskData is maskData
+        assert self.obj.mapMaskData() is maskData
+        assert self.obj.unmapMaskData() is True
+        assert self.obj.unmapMaskData() is False  # nothing left mapped
+        maskData = self.obj.mapMaskData()
+
+        # mapping the mask and image at once keeps them apart
+        imageData = self.obj.imageData
+        assert imageData.shape == (16, 32, 3)
+        imageData[:] = 0.5
+
+        # writes survive being pushed to the texture and read back
+        maskData[:32, :] = 0
+        self.obj.draw()
+        self.win.flip()
+        readback = self.obj.maskData
+        assert readback is not maskData
+        assert (readback[:32, :] == 0).all()
+        assert readback[48, 32] == 255
+        assert (self.obj.imageData == 0.5).all()
+
+        # assigning to the property writes the whole array through
+        self.obj.maskData = np.full((64, 64), 128, dtype=np.uint8)
+        assert (self.obj.maskData == 128).all()
+
+        # regenerating the mask replaces the mapping and the edits
+        self.obj.texRes = 32
+        assert self.obj.maskData.shape == (32, 32)
+        assert self.obj.maskData[0, 0] == 0
+
+        # a mask of None is a single opaque pixel
+        self.obj.mask = None
+        assert self.obj.maskData.shape == (1, 1)
+        assert self.obj.maskData[0, 0] == 255
+
+        # changing the image doesn't disturb the mask
+        self.obj.image = None
+        assert self.obj.imageData is None
+        assert self.obj.maskData.shape == (1, 1)
+
+    def test_greyscale_image_mask(self):
+        """
+        Check that a greyscale image used as a mask ends up in the texture as
+        the bytes it started as, rather than as the floats it is loaded as
+        """
+        import numpy as np
+        from PIL import Image
+
+        # every byte value, so any loss in the conversion would show
+        gradient = np.arange(256, dtype=np.uint8).reshape(8, 32)
+        for mode in ('L', 'RGB'):
+            im = Image.fromarray(gradient).convert(mode)
+            self.obj.mask = im
+            maskData = self.obj.maskData
+            assert maskData.dtype == np.uint8
+            # rows are flipped since row 0 is the bottom in OpenGL
+            assert (maskData == gradient[::-1]).all(), mode
+
+    def test_aspect_ratio(self):
+        """
+        Test that images set with one or both dimensions as None maintain their aspect ratio
+        """
+        # size of the window in 'pix' units, which is smaller than its size in
+        # framebuffer pixels on high-DPI (e.g. Retina) displays
+        pixSize = self.win.size / self.win.pixScaleFactor
+        cases = [
+            # norm 1:1
+            {"img": "default.png", "aspect": (1, 1),
+             "size": (None, 2), "units": "norm",
+             "tag": "default_xNone_yFull"},
+            {"img": "default.png", "aspect": (1, 1),
+             "size": (2, None), "units": "norm",
+             "tag": "default_xFull_yNone"},
+            {"img": "default.png", "aspect": (1, 1),
+             "size": (None, None), "units": "norm",
+             "tag": "default_xNone_yNone"},
+            {"img": "default.png", "aspect": (1, 1),
+             "size": None, "units": "norm",
+             "tag": "default_None"},
+            # height 1:1
+            {"img": "default.png", "aspect": (1, 1),
+             "size": (None, 1), "units": "height",
+             "tag": "default_xNone_yFull"},
+            {"img": "default.png", "aspect": (1, 1),
+             "size": (1 / self.win.size[1] * self.win.size[0], None), "units": "height",
+             "tag": "default_xFull_yNone"},
+            {"img": "default.png", "aspect": (1, 1),
+             "size": (None, None), "units": "height",
+             "tag": "default_xNone_yNone"},
+            {"img": "default.png", "aspect": (1, 1),
+             "size": None, "units": "height",
+             "tag": "default_None"},
+            # pix 1:1
+            {"img": "default.png", "aspect": (1, 1),
+             "size": (None, pixSize[1]), "units": "pix",
+             "tag": "default_xNone_yFull"},
+            {"img": "default.png", "aspect": (1, 1),
+             "size": (pixSize[0], None), "units": "pix",
+             "tag": "default_xFull_yNone"},
+            {"img": "default.png", "aspect": (1, 1),
+             "size": (None, None), "units": "pix",
+             "tag": "default_xNone_yNone"},
+            {"img": "default.png", "aspect": (1, 1),
+             "size": None, "units": "pix",
+             "tag": "default_None"},
+        ]
+        for case in cases:
+            # Set image
+            self.obj.image = case['img']
+            # Set size
+            self.obj.units = case['units']
+            self.obj.size = case['size']
+            # Check that aspect ratio is still correct
+            assert self.obj.aspectRatio == case['aspect']
+            # Check that image looks as expected
+            self.obj.draw()
+            filename = f"test_image_aspect_{case['tag']}.png"
+            # self.win.getMovieFrame(buffer='back').save(Path(utils.TESTS_DATA_PATH) / filename)
+            utils.compareScreenshot(Path(utils.TESTS_DATA_PATH) / filename, self.win, crit=7)
+            self.win.flip()
+
+
+class TestImageAnimation:
+    """
+    Tests for using ImageStim to create frame animations
+    """
+    @classmethod
+    def setup_class(cls):
+        nFrames = 16
+        # Define array of sizes/desired frame rates
+        cls.cases = [
+            {'size': 6 ** 2, 'fps': 16},
+            {'size': 8 ** 2, 'fps': 16},
+            {'size': 10 ** 2, 'fps': 8},
+            {'size': 12 ** 2, 'fps': 2},
+        ]
+        # Create frames
+        for i, case in enumerate(cls.cases):
+            size = case['size']
+            # Create window and shapes
+            win = visual.Window(size=(size, size), color='purple',
+                                title=f"{cls.__name__}::setup_class")
+            shape1 = visual.ShapeStim(win,
+                                      pos=(0.2, 0.2), size=(0.5, 0.5),
+                                      lineWidth=size * 0.1,
+                                      fillColor='red', lineColor='green',
+                                      )
+            shape2 = visual.ShapeStim(win,
+                                      pos=(-0.2, -0.2), size=(0.5, 0.5),
+                                      lineWidth=size * 0.1,
+                                      fillColor='blue', lineColor='yellow'
+                                      )
+
+            frames = []
+
+            for thisFrame in range(nFrames):
+                # Cycle window hue
+                win.color = colors.Color(
+                    (win._color.hsv[0] + 360 * thisFrame / nFrames, win._color.hsv[1], win._color.hsv[2]),
+                    'hsv'
+                )
+                # Cycle shape hues
+                shape1._fillColor.hsv = (
+                    shape1._fillColor.hsv[0] + 360 * thisFrame / nFrames, shape1._fillColor.hsv[1],
+                    shape1._fillColor.hsv[2]
+                )
+                shape1._borderColor.hsv = (
+                    shape1._borderColor.hsv[0] - 360 * thisFrame / nFrames, shape1._borderColor.hsv[1],
+                    shape1._borderColor.hsv[2]
+                )
+                shape2._fillColor.hsv = (
+                    shape2._fillColor.hsv[0] + 360 * thisFrame / nFrames, shape2._fillColor.hsv[1],
+                    shape2._fillColor.hsv[2]
+                )
+                shape2._borderColor.hsv = (
+                    shape2._borderColor.hsv[0] - 360 * thisFrame / nFrames, shape2._borderColor.hsv[1],
+                    shape2._borderColor.hsv[2]
+                )
+                # Rotate shapes
+                shape1.ori = shape1.ori + 360 * thisFrame / nFrames
+                shape2.ori = shape2.ori - 360 * thisFrame / nFrames
+                # Render
+                win.flip()
+                shape1.draw()
+                shape2.draw()
+                # Get frame
+                frame = win.getMovieFrame(buffer='back')
+                frames.append(
+                    frame
+                )
+
+            # Cleanup
+            win.close()
+            del shape1
+            del shape2
+            # Update case
+            cls.cases[i]['frames'] = frames
+
+    def setup_method(self, method):
+        # name windows after the test, so it's clear which one is running
+        self.testName = f"{type(self).__name__}::{method.__name__}"
+
+    def test_fps(self):
+        """
+        Check that images can be updated sufficiently fast to create frame animations
+        """
+        # skip speed tests under vm
+        if utils.RUNNING_IN_VM:
+            pytest.skip()
+        # Create clock
+        clock = core.Clock()
+        # Try at each size
+        for case in self.cases:
+            size = case['size']
+            # Make window and image
+            win = visual.Window(size=(size, size), title=self.testName)
+            img = visual.ImageStim(win, units='pix', size=(size, size))
+            # Iterate through frames
+            refr = []
+            for frame in case['frames']:
+                # Reset clock
+                clock.reset()
+                # Set image contents
+                img.image = frame
+                # Update
+                img.draw()
+                win.flip()
+                # Store time taken
+                refr.append(clock.getTime())
+            # Print frame rate for this size
+            fps = round(1 / max(refr))
+            assert fps > case['fps'], (
+                f"Max frame rate for {size}x{size} animations should be at least {case['fps']}, but was {fps}"
+            )
+            # Cleanup
+            win.close()
+            del img
+            

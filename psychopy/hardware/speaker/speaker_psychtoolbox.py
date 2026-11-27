@@ -1,0 +1,526 @@
+# -*- coding: utf-8 -*-
+
+"""Speaker device interface for `psychtoolbox` backend.
+"""
+
+# Part of the PsychoPy library
+# Copyright (C) 2002-2018 Jonathan Peirce (C) 2019-2025 Open Science Tools Ltd.
+# Distributed under the terms of the GNU General Public License (GPL).
+
+import io
+import sys
+import contextlib
+from psychopy.hardware.exceptions import DeviceNotConnectedError
+from psychopy.hardware.speaker._base import BaseSpeakerDevice
+from psychopy.localization import _translate
+from psychopy.preferences import prefs
+from psychopy import logging
+from psychopy.tools import systemtools
+
+
+class PsychtoolboxSpeakerDevice(BaseSpeakerDevice):
+    """Class for managing a physical speaker device for audio playback.
+
+    Parameters
+    ----------
+    index : int, optional
+        Numeric index for the physical speaker device, according to psychtoolbox. Leave as None to 
+        find the speaker by name.
+    name : str, optional
+        String name for the physical speaker device, according to your operating system. Leave as 
+        None to find the speaker by numeric index.
+    latencyClass : int
+        One of:
+
+        * 0: Don't take exclusive control over the speaker, so other apps can still use it. Send 
+        sounds via the system mixer so that sample rates are all handled, even though this 
+        introduces latency.
+
+        * 1: Don't take exclusive control over the speaker, so other apps can still use it. Send 
+        sounds directly to reduce latency, so sounds will need to match the sample rate of the 
+        speaker. **Recommended in most cases; if `resample` is True then sample rates are 
+        already handled on load!**
+
+        * 2: Take exclusive control over the speaker, so other apps can't use it. Send sounds 
+        directly to reduce latency, so sounds will need to be the same sample rate as one 
+        another, but this can be any sample rate supported by the speaker.
+
+        * 3: Take exclusive control over the speaker, so other apps can't use it. Send sounds 
+        directly to reduce latency, so sounds will need to be the same sample rate as one 
+        another, but this can be any sample rate supported by the speaker. Force the system to 
+        prioritise resources towards playing sounds on this speaker for absolute minimum 
+        latency, but fallback to mode 2 if the system rejects this.
+
+        * 4: Take exclusive control over the speaker, so other apps can't use it. Send sounds 
+        directly to reduce latency, so sounds will need to be the same sample rate as one 
+        another, but this can be any sample rate supported by the speaker. Force the system to 
+        prioritise resources towards playing sounds on this speaker for absolute minimum 
+        latency, and raise an error if the system rejects this.
+    resample : bool, optional
+        If the sample rate of an audio clip doesn't match the sample rate of the speaker, should 
+        PsychoPy resample the sound on load?
+    """
+    backend = 'ptb'
+    # dict of extant streams, by numeric index
+    streams = {}
+
+    def __init__(self, index=None, name=None, latencyClass=1, resample=True):
+        if index is not None and name is not None:
+            logging.warn(
+                "Both 'index' and 'name' were provided to SpeakerDevice; ignoring 'index'"
+            )
+            index = None
+        # handle string index, which may be a number or a device name
+        if isinstance(index, str):
+            requested = index
+            index = self.getNumericIndex(index)
+            if index is None:
+                # rather than fall back to the default speaker, which would play somewhere
+                # other than asked without saying so
+                raise DeviceNotConnectedError(
+                    _translate(
+                        "No speaker device found with index or name '{}'"
+                    ).format(requested),
+                    deviceClass=PsychtoolboxSpeakerDevice)
+
+        # if index is default, get default speaker device
+        if index in (-1, None) and name is None:
+            index = None  # set to none so we can find by name later
+            pref = prefs.hardware['audioDevice']
+            pref = pref[0] if isinstance(pref, (list, tuple)) else pref
+
+            if pref in ("default", "None"):
+                # if no pref, use first device
+                name = self.getAvailableDevices()[0]['deviceName']
+                # warn the user, this speaker might be a virtual device with no audio or something
+                logging.warn(
+                    _translate(
+                        "No default speaker specified in Preferences / Hardware, using first speaker found: {}"
+                    ).format(name)
+                )
+            else:
+                # if pref is a name, use that
+                name = pref
+
+        # store name and index
+        self.name = name
+        self.index = index
+
+        # store playback prefs
+        self.resample = resample
+        self.latencyClass = latencyClass
+        # find the device and start a stream on it straight away, since some outputs (such as
+        # HDMI audio) take a second or so to start playing a new stream, which would cut off
+        # the start of the first sound. Sounds are only ever mono or stereo, so open as many
+        # channels as a stereo clip needs; clips are padded to fit a stream with more.
+        self.stream = None
+        self.findProfile()
+        self.open(channels=min(2, self.channels))
+
+    @staticmethod
+    def getNumericIndex(index):
+        """
+        Get the numeric index of a device by its string index.
+        """
+        # try simple string parse for e.g. "1"
+        try:
+            return int(float(index))
+        except ValueError:
+            pass
+        # iterate through known devices
+        for profile in PsychtoolboxSpeakerDevice._getDevicesPsychtoolbox():
+            # skip input-only devices (microphones)
+            if profile['NrOutputChannels'] == 0:
+                continue
+            # match name
+            if profile.get('DeviceName', None) == index:
+                    return int(profile['DeviceIndex'])
+    
+    @property
+    def exclusive(self):
+        """
+        Returns
+        -------
+        bool
+            Does PsychoPy have exclusive control of this speaker? If True then other apps will not be 
+            able to play sounds on the same speaker.
+        """
+        return self.latencyClass >= 2
+    
+    def findProfile(self):
+        """
+        Find the psychtoolbox profile for this device, without creating a stream.
+
+        Attributes
+        ----------
+        Calling this method will set the following attributes:
+
+        profile : dict
+            The profile from psychtoolbox, a dict with the following keys: Active, State, 
+            RequestedStartTime, StartTime, CaptureStartTime, RequestedStopTime, EstimatedStopTime, 
+            CurrentStreamTime, ElapsedOutSamples, PositionSecs, RecordedSecs, ReadSecs, 
+            SchedulePosition, XRuns, TotalCalls, TimeFailed, BufferSize, CPULoad, PredictedLatency, 
+            LatencyBias, SampleRate, OutDeviceIndex, InDeviceIndex
+        index : int
+            A numeric index referring to the device. This may differ from the value of `index` this 
+            object was initialised with, as this will be the numeric index of the actual physical 
+            speaker best matching what was requested.
+        name : str
+            A string name referring to the device. This may differ from the value of `name` this 
+            object was initialised with, as this will be the system-reported name of the actual 
+            physical speaker best matching what was requested.
+        sampleRateHz : int
+            The sample rate of the device. Until a stream is created, this is the device's default 
+            sample rate.
+        channels : int
+            The number of output channels. Until a stream is created, this is the maximum number of 
+            channels the device supports.
+        """
+        # get the devices from psychtoolbox, which raises a plain `Exception` rather than giving
+        # an empty list when PortAudio finds no devices at all
+        try:
+            allFoundDevices = self._getDevicesPsychtoolbox()
+        except Exception as err:
+            raise DeviceNotConnectedError(
+                _translate("No audio devices found! ({})").format(err),
+                deviceClass=PsychtoolboxSpeakerDevice
+            ) from err
+
+        if not allFoundDevices:
+            raise DeviceNotConnectedError(
+                _translate("No audio devices found!"),
+                deviceClass=PsychtoolboxSpeakerDevice
+            )
+        
+        # find ptb profile for this device
+        findByName = self.index is None and self.name is not None
+        self.profile = None
+        for thisProfile in allFoundDevices:
+            # skip input-only devices (microphones)
+            if thisProfile['NrOutputChannels'] == 0:
+                continue
+
+            if findByName and self.name == thisProfile['DeviceName']:
+                self.profile = thisProfile
+                break
+            else:  # use index instead
+                if self.index == thisProfile['DeviceIndex']:
+                    self.profile = thisProfile
+                    break
+
+        # raise error if device not found
+        if self.profile is None:
+            raise DeviceNotConnectedError(
+                _translate(
+                    "No speaker device found with {key} '{name}'"
+                ).format(name=self.name if findByName else self.index, key="name" if findByName else "index"),
+                deviceClass=PsychtoolboxSpeakerDevice
+            )
+        
+        logging.debug(
+            f"Found speaker device: {self.profile['DeviceName']} ({self.profile['DeviceIndex']})"
+        )
+
+        self.index = self.profile['DeviceIndex']
+        self.name = self.profile['DeviceName']
+        self.sampleRateHz = int(self.profile['DefaultSampleRate'])
+        self.channels = int(self.profile['NrOutputChannels'])
+        # if physical device already has a stream, use it rather than making a new one
+        self._useExistingStream()
+
+    def _useExistingStream(self):
+        """
+        If the physical device already has an open stream, use it (and its sample rate and number 
+        of channels) rather than making a new one.
+
+        Returns
+        -------
+        bool
+            True if an existing stream was found
+        """
+        existing = PsychtoolboxSpeakerDevice.streams.get(self.index, None)
+        # forget streams which have since been closed
+        if existing is not None and not isinstance(existing['stream'].status, dict):
+            del PsychtoolboxSpeakerDevice.streams[self.index]
+            existing = None
+        if existing is None:
+            return False
+        
+        self.stream = existing['stream']
+        self.sampleRateHz = existing['sampleRateHz']
+        self.channels = existing['channels']
+
+        return True
+
+    def createStream(self, channels=None):
+        """
+        Create the psychtoolbox audio stream, if this device doesn't have one already.
+
+        Parameters
+        ----------
+        channels : int, optional
+            Number of output channels to open the stream with. If None, will use the maximum 
+            number of channels the device supports. Ignored if the device already has a stream, 
+            in which case `channels` will be the number of channels the stream was created with.
+        """
+        if self.stream is not None and isinstance(self.stream.status, dict):
+            return
+        self.stream = None
+        # if physical device already has a stream, use it rather than making a new one
+        if self._useExistingStream():
+            return
+        # get psychtoolbox
+        ptb = systemtools.importPsychtoolbox('psychtoolbox.audio')
+        # can't open more channels than the device has
+        maxChannels = int(self.profile['NrOutputChannels'])
+        if channels is None:
+            channels = maxChannels
+        channels = min(int(channels), maxChannels)
+
+        # try to connect using profile at various sample rates
+        for sampleRateHz in (
+            # start with the rate from profile (this will usually work)
+            int(self.profile['DefaultSampleRate']), 
+            # if that fails, try some common sample rates
+            48000,
+            44100, 
+            22050, 
+            16000
+        ):
+            # stop trying new options once we have a stream
+            if self.stream is not None:
+                continue
+            # try this sample rate
+            try:
+                # redirect stderr to a buffer to avoid ptb error spam
+                outBuff = io.StringIO()
+                errBuff = io.StringIO()
+                with contextlib.redirect_stdout(outBuff):
+                    with contextlib.redirect_stderr(errBuff):
+                        self.stream = ptb.Stream(
+                            mode=1+8,
+                            device_id=self.profile['DeviceIndex'],
+                            freq=sampleRateHz,
+                            channels=channels,
+                            latency_class=self.latencyClass,
+                            buffer_size=None
+                        )
+                # if it worked, set own parameters
+                self.sampleRateHz = sampleRateHz
+                self.channels = channels
+                # ...and log/print the stderr from psychtoolbox (only if successful!)
+                logs = errBuff.getvalue() + outBuff.getvalue()
+                for line in logs.split("\n"):
+                    if line.startswith("PTB-INFO: "):
+                        logging.info(line[10:])
+                    elif line.startswith("PTB-ERROR: "):
+                        logging.error(line[11:])
+                    elif line.strip():
+                        print(line)
+            except Exception:
+                pass
+        # if everything failed, raise an error
+        if self.stream is None:
+            raise ConnectionError(
+                "Failed to setup a PsychToolBox audio stream for device %(DeviceName)s "
+                "(%(DeviceIndex)s)." % self.profile
+            )
+        # store stream so other objects for the same physical device can use it
+        PsychtoolboxSpeakerDevice.streams[self.index] = {
+            'stream': self.stream,
+            'sampleRateHz': self.sampleRateHz,
+            'channels': self.channels,
+        }
+
+        logging.info(
+            f"Created stream for speaker device: {self.profile['DeviceName']} "
+            f"({self.profile['DeviceIndex']}) with {self.channels} channels at "
+            f"{self.sampleRateHz}Hz"
+        )
+    
+    def open(self, channels=None):
+        """
+        Open the audio stream for this speaker so that sound can be played to it.
+
+        Parameters
+        ----------
+        channels : int, optional
+            Number of output channels to create the stream with, if it doesn't exist yet. If None, 
+            will use the maximum number of channels the device supports.
+        """
+        self.createStream(channels=channels)
+        if not self.isOpen:
+            self.stream.start(0, 0, 1)
+    
+    def close(self):
+        """
+        Close the audio stream for this speaker.
+        """
+        if self.isOpen:
+            self.stream.close()
+    
+    @property
+    def isOpen(self):
+        """
+        Is this speaker "open", i.e. is it active and ready for a Sound to play tracks on it
+        """
+        # stream isn't created until it's needed
+        if self.stream is None:
+            return False
+        # sometimes a closed stream will have an integer for status
+        if not isinstance(self.stream.status, dict):
+            return False
+        
+        return bool(self.stream.status['Active'])
+    
+    def isSameDevice(self, other):
+        """
+        Determine whether this object represents the same physical speaker as a given other object.
+
+        Parameters
+        ----------
+        other : SpeakerDevice, dict
+            Other SpeakerDevice to compare against, or a dict of params (which must include
+            `index` as a key)
+
+        Returns
+        -------
+        bool
+            True if the two objects represent the same physical device
+        """
+        if isinstance(other, type(self)):
+            # if given another object, get index
+            index = other.index
+        elif isinstance(other, dict) and "index" in other:
+            # if given a dict, get index from key
+            index = other['index']
+        else:
+            # if the other object is the wrong type or doesn't have an index, it's not this
+            return False
+
+        return index in (self.index, self.name)
+    
+    def testDevice(self):
+        """
+        Play a simple sound to check whether this device is working.
+        """
+        from psychopy.sound import Sound
+        import time
+        # create a basic sound
+        snd = Sound(
+            speaker=self,
+            value="A",
+            stereo=self.channels > 1,
+            sampleRate=self.sampleRateHz
+        )
+        # play the sound for 1s
+        snd.play()
+        time.sleep(1)
+        snd.stop()
+
+    @staticmethod
+    def _getDevicesSoundDevice():
+        """Get a list of available speaker configurations using the sounddevice 
+        backend.
+
+        Returns
+        -------
+        list[dict]
+            A list of dicts, each describing a speaker device.
+        
+        """
+        import sounddevice as sd
+
+        devices = []
+        for dev in sd.query_devices():
+            # build a dict with the same keys as psychtoolbox for consistency 
+            devDict = { 
+                'DeviceIndex': dev['index'],
+                'HostAudioAPIId': dev['hostapi'],
+                'HostAudioAPIName': sd.query_hostapis(dev['hostapi'])['name'],
+                'DeviceName': dev['name'],
+                'NrInputChannels': dev['max_input_channels'],
+                'NrOutputChannels': dev['max_output_channels'],
+                'LowInputLatency': dev['default_low_input_latency'],
+                'HighInputLatency': dev['default_high_input_latency'],
+                'LowOutputLatency': dev['default_low_output_latency'],
+                'HighOutputLatency': dev['default_high_output_latency'],
+                'DefaultSampleRate': dev['default_samplerate']
+            }
+            devices.append(devDict)
+
+        return devices
+    
+    @staticmethod
+    def _getDevicesPsychtoolbox():
+        """Get a list of available speaker configurations using the psychtoolbox 
+        backend.
+
+        Returns
+        -------
+        list[dict]
+            A list of dicts, each describing a speaker device.
+        
+        """
+        ptb = systemtools.importPsychtoolbox('psychtoolbox.audio')
+
+        try:
+            wasapiPref = prefs.hardware['audioWASAPIOnly']
+        except KeyError:
+            wasapiPref = False
+
+        deviceType = 13 if sys.platform == 'win32' and wasapiPref else None
+
+        return ptb.get_devices(device_type=deviceType)
+
+    @staticmethod
+    def isAvailable():
+        """Whether `psychtoolbox` audio can be imported, which this backend needs.
+        """
+        try:
+            systemtools.importPsychtoolbox('psychtoolbox.audio')
+        except ImportError:
+            return False
+
+        return True
+
+    @staticmethod
+    def getAvailableDevices():
+        """Get available speaker devices.
+        
+        Returns
+        -------
+        list[dict]
+            A list of dicts, each describing a speaker device. Each dict has the keys `deviceName`, 
+            `index`, and `name`.
+        
+        """
+        # skip in vm
+        if systemtools.isVM_CI():  # GitHub actions VM does not have a sound device
+            return []
+
+        try:
+            found = PsychtoolboxSpeakerDevice._getDevicesPsychtoolbox()
+        except ImportError as err:
+            # without psychtoolbox there are no speakers this backend can play on
+            logging.debug(f"Can't list psychtoolbox speakers: {err}")
+            return []
+
+        devices = []
+        for profile in found:
+            # skip input-only devices (microphones)
+            if profile['NrOutputChannels'] == 0:
+                continue
+            # construct profile
+            device = {
+                'deviceName': profile.get('DeviceName', "Unknown Speaker"),
+                'deviceClass': "psychopy.hardware.speaker.SpeakerDevice",
+                'index': profile.get('DeviceName', None)
+            }
+            devices.append(device)
+
+        return devices
+    
+
+if __name__ == "__main__":
+    pass

@@ -1,0 +1,728 @@
+# -*- coding: utf-8 -*-
+
+"""SoundDevice interface for microphones.
+"""
+
+# Part of the PsychoPy library
+# Copyright (C) 2002-2018 Jonathan Peirce (C) 2019-2025 Open Science Tools Ltd.
+# Distributed under the terms of the GNU General Public License (GPL).
+
+__all__ = [
+    "SoundDeviceMicrophoneDevice",
+]
+
+import sys
+import time
+from ._base import BaseMicrophoneDevice, MicrophoneResponse
+import numpy as np
+from psychopy import logging as logging
+from psychopy.hardware.exceptions import DeviceNotConnectedError
+from psychopy.localization import _translate
+from psychopy.hardware import BaseResponseDevice
+from psychopy.sound.audiodevice import AudioDeviceInfo, getSoundDeviceHostAPI
+from psychopy.sound.exceptions import AudioInvalidCaptureDeviceError, AudioInvalidDeviceError, \
+    AudioStreamError
+from psychopy.tools import systemtools as st
+
+    
+class SoundDeviceMicrophoneDevice(BaseMicrophoneDevice, aliases=["mic", "microphone"]):
+    """Microphone device class for the SoundDevice audio library.
+
+    This class is used internally by `MicrophoneDevice` when the SoundDevice
+    audio library is selected. Users usually do not create instances of this
+    class themselves.
+
+    """
+    def __init__(
+            self,
+            index=None,
+            sampleRateHz=None,
+            channels=None,
+            streamBufferSecs=2.0,
+            maxRecordingSize=-1,
+            policyWhenFull='warn',
+            exclusive=False,
+            audioRunMode=1,
+            # legacy
+            audioLatencyMode=None
+        ):
+        super().__init__()
+        
+        try:
+            import sounddevice  # load and check
+        except ImportError:
+             raise ModuleNotFoundError(
+                "Microphone audio capture requires package `sounddevice` to "
+                "be installed.")
+
+        from psychopy.hardware import DeviceManager
+
+        # numericise index if needed
+        if isinstance(index, str):
+            try:
+                index = int(index)
+            except ValueError:
+                pass
+
+        # get information about the selected device
+        if isinstance(index, AudioDeviceInfo):
+            # if already an AudioDeviceInfo object, great!
+            self._device = index
+        elif index in (-1, None):
+            # get all devices
+            _devices = SoundDeviceMicrophoneDevice.getDevices()
+            # if there are none, error
+            if not len(_devices):
+                raise DeviceNotConnectedError(
+                    _translate(
+                        "Could not choose default recording device as no recording "
+                        "devices are connected."
+                    ), 
+                    deviceClass=SoundDeviceMicrophoneDevice
+                )
+
+            # Try and get the best match which are compatible with the user's
+            # specified settings.
+            if sampleRateHz is not None or channels is not None:
+                self._device = self.findBestDevice(
+                    index=_devices[0].deviceIndex,  # use first that shows up
+                    sampleRateHz=sampleRateHz,
+                    channels=channels
+                )
+            else:
+                self._device = _devices[0]
+            
+            # Check if the default device settings are differnt than the ones 
+            # specified by the user, if so, warn them that the default device
+            # settings are overwriting their settings.
+            if channels is None:
+                channels = self._device.inputChannels
+            elif channels != self._device.inputChannels:
+                logging.warning(
+                    "Number of channels specified ({}) does not match the "
+                    "default device's number of input channels ({}).".format(
+                        channels, self._device.inputChannels))
+                channels = self._device.inputChannels
+
+            if sampleRateHz is None:
+                sampleRateHz = self._device.defaultSampleRate
+            elif sampleRateHz != self._device.defaultSampleRate:
+                logging.warning(
+                    "Sample rate specified ({}) does not match the default "
+                    "device's sample rate ({}).".format(
+                        sampleRateHz, self._device.defaultSampleRate))
+                sampleRateHz = self._device.defaultSampleRate
+
+        elif isinstance(index, str):
+            # if given a str that's a name from DeviceManager, get info from device
+            device = DeviceManager.getDevice(index)
+            # try to duplicate and fail if not found
+            if isinstance(device, SoundDeviceMicrophoneDevice):
+                self._device = device._device
+            else:
+                # if not found, find best match
+                self._device = self.findBestDevice(
+                    index=index,
+                    sampleRateHz=sampleRateHz,
+                    channels=channels
+                )
+        else:
+            # get best match
+            self._device = self.findBestDevice(
+                index=index,
+                sampleRateHz=sampleRateHz,
+                channels=channels
+            )
+
+        devInfoText = ('Using audio device #{} ({}) for audio capture. '
+            'Full spec: {}').format(
+                self._device.deviceIndex, 
+                self._device.deviceName, 
+                self._device)
+        
+        logging.info(devInfoText)
+
+        # error if specified device is not suitable for capture
+        if not self._device.isCapture:
+            raise AudioInvalidCaptureDeviceError(
+                'Specified audio device not suitable for audio recording. '
+                'Has no input channels.')
+
+        # get these values from the configured device
+        self._channels = self._device.inputChannels
+        logging.debug('Set recording channels to {} ({})'.format(
+            self._channels, 'stereo' if self._channels > 1 else 'mono'))
+
+        self._sampleRateHz = self._device.defaultSampleRate
+        logging.debug('Set stream sample rate to {} Hz'.format(
+            self._sampleRateHz))
+
+        # Latency to ask PortAudio for. This is not the same thing as
+        # Psychtoolbox's `audioLatencyMode`, which is an enum: `sounddevice`
+        # wants either one of its own names or a number of seconds, and passing
+        # the mode number through means asking for one or two *seconds* of
+        # input latency. PsychoPy wants samples as promptly as the device can
+        # give them, so ask for the low-latency setting either way.
+        self._audioLatencyMode = 2 if exclusive else 1
+        self._streamLatency = 'low'
+        logging.debug(
+            'Set audio latency mode to {}, requesting {!r} stream '
+            'latency'.format(self._audioLatencyMode, self._streamLatency))
+
+        # Kept for signature compatibility with the other backends. This device
+        # hands samples straight to its clients from the stream callback rather
+        # than holding an internal buffer, so there is nothing to size here.
+        assert isinstance(streamBufferSecs, (float, int))
+        self._streamBufferSecs = float(streamBufferSecs)
+
+        self._audioRunMode = int(audioRunMode)
+
+        # listeners must exist before the stream opens, since the callback can
+        # start dispatching to them as soon as it does
+        self.listeners = []
+
+        # open stream
+        self._stream = None
+        self._opening = self._closing = False
+
+        self.open()
+
+    def __hash__(self):
+        # hash based on device index and name (which should be unique identifiers 
+        # for the physical device)
+        return hash((self._device.deviceIndex, self._device.deviceName))
+    
+    @property
+    def sampleRateHz(self):
+        """The sample rate of the audio stream in Hz. This is determined by the
+        device and cannot be changed by the user.
+
+        Returns
+        -------
+        float
+            Sample rate of the audio stream in Hz.
+
+        """
+        return self._sampleRateHz
+
+    @property
+    def channels(self):
+        """The number of audio channels in the input stream. This is determined by
+        the device and cannot be changed by the user.
+
+        Returns
+        -------
+        int
+            Number of audio channels in the input stream.
+
+        """
+        return self._channels
+
+    def _callback(self, indata, frames, timedat, status):
+        """Callback function for the sounddevice stream. This is called whenever
+        new audio data is available from the stream.
+
+        Parameters
+        ----------
+        indata : ndarray
+            The recorded audio data.
+        frames : int
+            The number of frames in `indata`.
+        timedat : CData
+            Timing information about the callback.
+        status : CallbackFlags
+            Status of the callback.
+
+        """
+        if self._closing or self._opening:
+            # if we're in the middle of opening or closing, ignore any callbacks 
+            # as they may be unstable
+            return
+        
+        timeAtADC = timedat.inputBufferAdcTime
+
+        if status:
+            logging.warning(f"SoundDevice stream callback returned with status: {status}")
+        
+        if len(indata):
+            # Keep the most recent block for `getCurrentVolume()`, which is used
+            # for volume meters and sound sensors. This is done for every block,
+            # whether or not anything is recording.
+            self._rtBuffer = indata.copy()
+
+        if len(indata) and self._clients:
+            # compute the absulute time of the end of the current recording pos
+            absBlockStartTime = timeAtADC
+            absBlockEndTime = absBlockStartTime + (frames / self._sampleRateHz)
+            
+            # iterate over attached microphone objects and write data to their 
+            # recording buffers if we're past the requested start time
+            for mic in self._clients:
+                reqStartTime = mic._tRecordingStartRequested
+                reqStopTime = mic._tRecordingStopRequested
+                if reqStartTime < absBlockEndTime and (
+                        reqStopTime is None or absBlockStartTime < reqStopTime):
+                    
+                    if not mic._isRecording:
+                        mic._startRecOffset = max(
+                            0, int((reqStartTime - absBlockStartTime) * self._sampleRateHz))
+                        mic._isRecording = True
+                    mic._recordingBuffer.append(indata.copy())
+                    mic._nRecordedFrames += frames
+
+                    if reqStopTime is not None and absBlockEndTime >= reqStopTime:
+                        mic._isRecording = False
+
+    @property
+    def index(self):
+        """Index of the device this microphone is using (`int` or `str`).
+        """
+        return self._device.deviceIndex
+
+    def open(self):
+        """Open the stream for this microphone device.
+        """
+        if self._stream is not None and self._stream.active:
+            logging.warning(
+                "Attempted to open microphone stream which is already open."
+            )
+            return
+        
+        try:
+            import sounddevice as sd
+        except (ModuleNotFoundError, ImportError):
+            msg = (
+                "Failed to open microphone stream because the 'sounddevice' library is "
+                "not installed."
+            )
+            logging.error(msg)
+            raise DeviceNotConnectedError(
+                _translate(msg),
+                deviceClass=SoundDeviceMicrophoneDevice) from None
+
+        # open a stream for this device
+        try:
+            self._stream = sd.InputStream(
+                samplerate=self._sampleRateHz,
+                channels=self._channels,
+                device=self._device.deviceIndex,
+                latency=self._streamLatency,
+                callback=self._callback,
+                blocksize=0,  # use default blocksize
+                dtype='float32',  # use 32-bit float for recording
+            )
+        except Exception as e:
+            logging.error(f"Error occurred while opening microphone stream: {e}")
+            raise AudioStreamError(
+                "An error occurred while opening the microphone stream. See logs for details."
+            ) from e
+
+        self._stream.start()
+
+    def close(self):
+        """Close the stream for this microphone device.
+        """
+        # if we have microphones attached to this stream, don't close it until 
+        # all microphones have been removed
+        if self._clients:
+            return 
+
+        if self._stream is None:
+            logging.warning(
+                "Attempted to close microphone stream which is already closed."
+            )
+            return
+
+        try:
+            self._stream.stop()
+            self._stream.close()
+        except Exception as e:
+            logging.error(f"Error occurred while closing microphone stream: {e}")
+            raise AudioStreamError(
+                "An error occurred while closing the microphone stream. See logs for details."
+            ) from e
+    
+    def getRecording(self):
+        """Get the recorded audio data.
+
+        **Not supported by this backend.** This device does not keep a recording
+        of its own: it writes samples straight into the buffer of each client
+        bound to it, each of which has its own recording window. Ask the client
+        for its recording instead, for example
+        `psychopy.sound.Microphone.getRecording()`.
+
+        Raises
+        ------
+        NotImplementedError
+            Always.
+
+        """
+        raise NotImplementedError(
+            "`SoundDeviceMicrophoneDevice` does not hold a recording of its "
+            "own. Samples are written to the clients bound to this device, so "
+            "call `getRecording()` on the client (e.g. the `Microphone` or "
+            "`Camera` object) which requested the recording.")
+
+    def _getTime(self):
+        """Get current time from the same timebase as the stream.
+        
+        Returns
+        -------
+        float
+            Current time in seconds from the same timebase as the stream.
+        
+        """
+        return time.monotonic()  # sounddevice uses monotonic timebase for its callbacks
+    
+    def record(self, when=None, waitForStart=0, stopTime=None):
+        """Start recording from the microphone. This method is an alias for `start()`.
+        
+        **Deprecated**: No longer in use. Recordings are now managed by the 
+        microphone objects attached to this device. Call `start()` on the 
+        microphone object to begin recording, and `stop()` to end recording.
+
+        """
+        pass
+
+    def start(self, when=None, waitForStart=0, stopTime=None):
+        """Start recording from the microphone. Alias for `record()`.
+
+        **Deprecated**: No longer in use. Recordings are now managed by the 
+        microphone objects attached to this device. Call `start()` on the 
+        microphone object to begin recording, and `stop()` to end recording.
+
+        """
+        self.record(when=when, waitForStart=waitForStart, stopTime=stopTime)
+    
+    def stop(self, *args, **kwargs):
+        """Stop recording from the microphone.
+
+        **Deprecated**: No longer in use. Recordings are now managed by the 
+        microphone objects attached to this device. Call `stop()` on the 
+        microphone object to end recording.
+
+        """
+        pass
+
+    def pause(self):
+        """Pause recording from the microphone. Can be resumed with `record()`."""
+        pass
+
+    def poll(self):
+        """Poll the microphone for new data. 
+        """
+        pass  # nop
+
+    def getCurrentVolume(self):
+        """Get the current volume level of the microphone input.
+
+        Returns
+        -------
+        float
+            Current volume level, typically in the range [0.0, 1.0].
+
+        """
+        # `_rtBuffer` holds the most recent block from the stream callback, and
+        # is empty until the first one arrives. Recorded audio is not used here:
+        # it belongs to the clients, and volume should be readable whether or
+        # not anything is recording.
+        latestBlock = self._rtBuffer
+
+        if latestBlock is None or not len(latestBlock):
+            return 0.0
+
+        # calculate RMS volume across all channels
+        return float(np.sqrt(np.mean(np.square(latestBlock))))
+
+    @staticmethod
+    def queryDevices():
+        """Query devices using device manager.
+        
+        Returns
+        -------
+        list of dict 
+            List of available microphone devices where configurations are given as
+            dicts in a format similar to PTB.
+
+        """
+        try:
+            import sounddevice as sd
+        except (ModuleNotFoundError, ImportError):
+            msg = (
+                "Failed to query audio output devices because the 'sounddevice' library is "
+                "not installed."
+            )
+            logging.error(msg)
+            raise DeviceNotConnectedError(
+                _translate(msg),
+                deviceClass=SoundDeviceMicrophoneDevice)
+
+        # only list devices from one host API (WASAPI on Windows), so that a
+        # name means one device
+        hostAPI = getSoundDeviceHostAPI()
+        hostAPINames = [api['name'] for api in sd.query_hostapis()]
+
+        devices = []
+        for dev in sd.query_devices():
+            # skip devices with no input channels, i.e. anything we cannot
+            # capture from
+            if dev['max_input_channels'] == 0:
+                continue
+            if hostAPI is not None and dev['hostapi'] != hostAPI:
+                continue
+
+            hostAPIName = hostAPINames[dev['hostapi']]
+
+            # build a dict with the same keys as psychtoolbox for consistency
+            devDict = {
+                'DeviceIndex': dev['index'],
+                'HostAudioAPIId': dev['hostapi'],
+                'HostAudioAPIName': hostAPIName,
+                'DeviceName': dev['name'],
+                'NrInputChannels': dev['max_input_channels'],
+                'NrOutputChannels': dev['max_output_channels'],
+                'LowInputLatency': dev['default_low_input_latency'],
+                'HighInputLatency': dev['default_high_input_latency'],
+                'LowOutputLatency': dev['default_low_output_latency'],
+                'HighOutputLatency': dev['default_high_output_latency'], 
+                'DefaultSampleRate': dev['default_samplerate']
+            }
+            devices.append(devDict)
+
+        return devices
+
+    def findBestDevice(self, index, sampleRateHz, channels):
+        """
+        Find the closest match among the microphone profiles listed by psychtoolbox as valid.
+
+        Parameters
+        ----------
+        index : int
+            Index of the device
+        sampleRateHz : int
+            Sample rate of the device
+        channels : int
+            Number of audio channels in input stream
+
+        Returns
+        -------
+        AudioDeviceInfo
+            Device info object for the chosen configuration
+
+        Raises
+        ------
+        logging.Warning
+            If an exact match can't be found, will use the first match to the device index and
+            raise a warning.
+        KeyError
+            If no match is found whatsoever, will raise a KeyError
+        """
+        # start off with no chosen device and no fallback
+        fallbackDevice = None
+        chosenDevice = None
+        # iterate through device profiles
+        for profile in self.getDevices():
+            # if same index, keep as fallback (the first, if a name matches several)
+            if fallbackDevice is None and index in (profile.deviceIndex, profile.deviceName):
+                fallbackDevice = profile
+            # if same everything, we got it!
+            if all((
+                index in (profile.deviceIndex, profile.deviceName),
+                profile.defaultSampleRate == sampleRateHz,
+                profile.inputChannels == channels,
+            )):
+                chosenDevice = profile
+
+        if chosenDevice is None and fallbackDevice is not None:
+            # if no exact match found, use fallback and raise warning
+            logging.warning(
+                f"Could not find exact match for specified parameters (index={index}, sampleRateHz="
+                f"{sampleRateHz}, channels={channels}), falling back to best approximation ("
+                f"index={fallbackDevice.deviceIndex}, "
+                f"name={fallbackDevice.deviceName},"
+                f"sampleRateHz={fallbackDevice.defaultSampleRate}, "
+                f"channels={fallbackDevice.inputChannels})"
+            )
+            chosenDevice = fallbackDevice
+        elif chosenDevice is None:
+            # if no index match found, raise error
+            raise DeviceNotConnectedError(
+                _translate(
+                    "Could not find any audio recording device with index {index}", 
+                ).format(index=index), 
+                deviceClass=SoundDeviceMicrophoneDevice
+            )
+
+        return chosenDevice
+
+    def isSameDevice(self, other):
+        """
+        Determine whether this object represents the same physical microphone as a given other
+        object.
+
+        Parameters
+        ----------
+        other : SoundDeviceMicrophoneDevice, dict
+            Other SoundDeviceMicrophoneDevice to compare against, or a dict of params (which must 
+            include `index` as a key)
+
+        Returns
+        -------
+        bool
+            True if the two objects represent the same physical device
+        """
+        if isinstance(other, type(self)):
+            # if given another object, get index
+            index = other.index
+        elif isinstance(other, dict) and "index" in other:
+            # if given a dict, get index from key
+            index = other['index']
+        else:
+            # if the other object is the wrong type or doesn't have an index, it's not this
+            return False
+
+        return index in (self.index, self._device.deviceName)
+
+    @staticmethod
+    def getDevices():
+        """Get a `list` of audio capture device (i.e. microphones) descriptors.
+        On Windows, only WASAPI devices are used.
+
+        Returns
+        -------
+        list
+            List of `AudioDevice` descriptors for suitable capture devices. If
+            empty, no capture devices have been found.
+
+        """
+        allDevs = SoundDeviceMicrophoneDevice.queryDevices()
+
+        # make sure we have an array of descriptors
+        allDevs = [allDevs] if isinstance(allDevs, dict) else allDevs
+
+        # create list of descriptors only for capture devices
+        devObjs = []
+        for dev in allDevs:
+            # descriptors share PTB's format, but were queried with sounddevice
+            desc = AudioDeviceInfo.createFromPTBDesc(dev)
+            desc.audioLib = 'sounddevice'
+            devObjs.append(desc)
+        inputDevices = [desc for desc in devObjs if desc.isCapture]
+
+        return inputDevices
+
+    @staticmethod
+    def isAvailable():
+        """Whether `sounddevice` can be imported, which this backend needs.
+        """
+        try:
+            import sounddevice  # noqa: F401
+        except (ImportError, OSError):  # OSError if PortAudio itself is missing
+            return False
+
+        return True
+
+    @staticmethod
+    def getAvailableDevices():
+        """Get available microphone devices using sounddevice.
+
+        Devices are listed by sounddevice itself rather than by Psychtoolbox, so
+        names, sample rates and channels are those this backend will open.
+
+        Returns
+        -------
+        list of dict
+            List of available microphone devices where configurations are given as
+            dicts in a format similar to PTB.
+
+        """
+        # skip in vm
+        if st.isVM_CI():  # GitHub actions VM does not have a sound device
+            return []
+
+        devices = []
+        for profile in SoundDeviceMicrophoneDevice.getDevices():
+            device = {
+                'deviceName': profile.deviceName,
+                'deviceClass': "psychopy.hardware.microphone.MicrophoneDevice",
+                # use the name as index, which is stable between sessions
+                'index': profile.deviceName,
+                'sampleRateHz': profile.defaultSampleRate,
+                'channels': profile.inputChannels,
+            }
+            devices.append(device)
+
+        return devices
+    
+    def addListener(self, listener, startLoop=False):
+        """
+        Add a listener, which will receive all the same messages as this device.
+
+        Parameters
+        ----------
+        listener : str or psychopy.hardware.listener.BaseListener
+            Either a Listener object, or use one of the following strings to create one:
+            - "liaison": Create a LiaisonListener with DeviceManager.liaison as the server
+            - "print": Create a PrintListener with default settings
+            - "log": Create a LoggingListener with default settings
+        startLoop : bool
+            If True, then upon adding the listener, start up an asynchronous loop to dispatch messages.
+        """
+        # add listener as normal
+        listener = BaseResponseDevice.addListener(self, listener, startLoop=startLoop)
+        # if we're starting a listener loop, start recording
+        if startLoop:
+            self.start()
+        
+        return listener
+
+    def clearListeners(self):
+        """
+        Remove any listeners from this device.
+
+        Returns
+        -------
+        bool
+            True if completed successfully
+        """
+        # clear listeners as normal
+        resp = BaseResponseDevice.clearListeners(self)
+        # stop recording
+        self.stop()
+
+        return resp
+
+    def dispatchMessages(self, clear=True):
+        """
+        Dispatch current volume as a MicrophoneResponse object to any attached listeners.
+
+        Parameters
+        ----------
+        clear : bool
+            If True, will clear the recording up until now after dispatching the volume. This is
+            useful if you're just sampling volume and aren't wanting to store the recording.
+
+        """
+        # If the stream is not running there is nothing to report. This checks
+        # the stream rather than `isStarted`, which belongs to the backends that
+        # start and stop recording on the device itself; this one streams
+        # continuously from the moment it is opened.
+        if self._stream is None or not self._stream.active:
+            return
+        
+        # create a response object
+        message = MicrophoneResponse(
+            logging.defaultClock.getTime(),
+            self.getCurrentVolume(),
+            device=self,
+        )
+
+        # dispatch to listeners
+        for listener in self.listeners:
+            listener.receiveMessage(message)
+        
+        return message
+
+if __name__ == "__main__":
+    pass
+
