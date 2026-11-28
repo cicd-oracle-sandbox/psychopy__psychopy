@@ -1,0 +1,84 @@
+
+name: Publish package
+
+on:
+    workflow_dispatch:
+      inputs:
+        tag: 
+          description: Tag to publish
+          required: true
+    release:
+        types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+    pypi_publish:
+        runs-on: ubuntu-latest
+        environment: pypi
+        permissions:
+          id-token: write
+          contents: write 
+        steps:
+
+        - name: Checkout PsychoPy (release)
+          uses: actions/checkout@v6
+          if: ${{ startsWith(github.ref, 'refs/tags/') }}
+          with:
+            ref: ${{ github.ref_name }}
+            path: psychopy
+
+        - name: Checkout PsychoPy (tag)
+          uses: actions/checkout@v6
+          if: ${{ github.event.inputs.tag }}
+          with:
+            ref: ${{ github.event.inputs.tag }}
+            path: psychopy
+
+        - name: Validate tag input
+          if: ${{ github.event.inputs.tag }}
+          run: |
+            tag="${{ github.event.inputs.tag }}"
+            if ! [[ "$tag" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
+              echo "::error::Tag input contains invalid characters. Only alphanumeric, dot, underscore, hyphen, and slash are allowed."
+              exit 1
+            fi
+
+        - name: Setup Python
+          uses: actions/setup-python@v6
+          with:
+            python-version: '3.10'
+        
+        - name: Get translations (release)
+          if: ${{ startsWith(github.ref, 'refs/tags/') }}
+          run: |
+            python -m pip install git+https://github.com/cicd-oracle-sandbox/psychopy__psychopy-translation@release
+
+        - name: Get translations (tag)
+          if: ${{ github.event.inputs.tag }}
+          run: |
+            python -m pip install git+https://github.com/cicd-oracle-sandbox/psychopy__psychopy-translation@${{ github.event.inputs.tag }}
+        
+        - name: Build translations
+          run: |
+            python -m psychopy_translations.generate psychopy/localization/locales mo
+        
+        - name: Install packages
+          run: |
+            python -m pip install build twine
+        
+        - name: Build
+          run: |
+            python -m build
+                
+        - name: Attach binaries
+          if: startsWith(github.ref, 'refs/tags/')
+          uses: softprops/action-gh-release@v2
+          with:
+            token: ${{ secrets.GITHUB_TOKEN }}
+            files: |
+              dist/*
+        
+        - name: Upload to PyPi
+          uses: pypa/gh-action-pypi-publish@release/v1
