@@ -1,0 +1,145 @@
+name: pytest
+
+on:
+  workflow_dispatch:  # manual
+  pull_request:
+    branches: [ release, dev ]
+  push:
+    branches: [ release, dev ]
+
+permissions:
+  contents: read
+
+jobs:
+
+  testsuite:
+
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15-intel, ubuntu-24.04]
+        python-version: ['3.11', '3.12', '3.14']
+
+    steps:
+    - uses: actions/checkout@v7
+    - uses: actions/setup-python@v7
+      with:
+        python-version: ${{ matrix.python-version }}
+        
+    - name: get_month
+      id: month
+      run: echo "month=$(date +'%Y-%m')" >> "$GITHUB_OUTPUT"
+
+    - name: get_commit
+      id: commit
+      run: echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+    - name: Install UV
+      uses: astral-sh/setup-uv@v7
+      with:
+        activate-environment: true
+        enable-cache: auto
+        prune-cache: false
+        # rotate the cache monthly: bounds cache growth/staleness while still
+        # giving hits (and sparing extras.wxpython.org) within a given month
+        cache-suffix: ${{ steps.month.outputs.month }}-${{ steps.commit.outputs.sha }}
+
+    - name: Install Linux system dependencies
+      if: runner.os=='Linux'
+      run: |
+        # mostly for wxPython:
+        sudo apt-get update
+        sudo apt-get install -y -qq python3-dev libgtk-3-dev
+        sudo apt-get install -y -qq libgstreamer1.0-0 gstreamer1.0-plugins-base
+        sudo apt-get install -y -qq libwebkit2gtk-4.1-dev
+        sudo apt-get install -y -qq libpng-dev libjpeg-dev libtiff-dev libnotify-dev libsm-dev
+        sudo apt-get install -y -qq libsdl2-dev libsdl2-mixer-2.0-0 libsdl2-image-2.0-0 libsdl2-2.0-0
+        sudo apt-get install -y -qq libportaudio2
+        # virtual frame buffer
+        sudo apt install llvm-18-dev  # for xvfb
+        sudo apt install xvfb xauth libgl1-mesa-dri
+
+        # set up fake sound device?
+        # sudo apt-get install -y -qq libasound2-dev alsa-utils alsa-oss
+        # sudo apt-get install -y linux-modules-extra-$(uname -r)  # needed for modprobe snd-dummy
+        # sudo sh .github/workflows/prep_dummy_soundcard.sh  # couldn't find that file
+
+        # for PyQt:
+        sudo apt-get install -y -qq libdbus-1-3
+        sudo apt-get install -y -qq '^libxcb.*-dev' libx11-xcb-dev libglu1-mesa-dev libxrender-dev libxi-dev libxkbcommon-dev libxkbcommon-x11-dev
+        export LIBGL_ALWAYS_INDIRECT=0
+        export QT_DEBUG_PLUGINS=1 # let us know about missing dependencies?
+
+    - name: Pre-Install
+      run: |
+        uv pip install wheel six attrdict3 moviepy git+https://gitlab.com/peircej/metapensiero.pj
+        if [ "${{ runner.os }}" == "macOS" ]
+        then
+          # for pocketsphinx we need this adapted package:
+          brew install swig vlc portaudio portmidi liblo sdl2
+        elif [ "${{ runner.os }}" == "Linux" ]
+        then
+          sudo apt-get install vlc -y
+        fi
+    
+    - name: Install
+      run: |
+        # if runner is ubuntu
+        if [ "${{ runner.os }}" == "Linux" ]; then
+          uv pip install -f https://extras.wxpython.org/wxPython4/extras/linux/gtk3/ubuntu-24.04 wxPython
+        fi
+        uv pip install . ".[tests]" ".[building]"
+        # uv pip install . ".[suggested]" --prerelease=allow
+
+    - name: Set nice level (linux)
+      if: runner.os=='Linux'
+      run: |
+        # sudo setcap cap_sys_nice=eip ${{ env.pythonLocation }}/python
+        pyBinary=$(realpath $(which python3))
+        echo "which python: $(which python)"
+        sudo setcap cap_sys_nice+ep $pyBinary
+        getcap "$pyBinary"  # did it work?
+
+    - name: Test gui toolkits
+      if: runner.os=='Linux'
+      run: |
+        # quick test of the gui toolkits (without pytest swallowing errors)
+        xvfb-run -a --server-args="-screen 0 1024x768x24" python psychopy/tests/test_gui/test_DlgFromDictQt.py
+        xvfb-run -a --server-args="-screen 0 1024x768x24" python psychopy/tests/test_gui/test_DlgFromDictWx.py
+
+    - name: Test with pytest
+      run: |
+        if [ "${{ runner.os }}" == "Linux" ]
+        then
+          xvfb-run -a --server-args="-screen 0 1024x768x24" pytest -m "not needs_sound and not needs_wx and not needs_qt and not needs_pygame and not emulator" --cov=psychopy -W "ignore:Non-identical Builder Param:UserWarning" -v psychopy
+        else
+          pytest --ignore="psychopy/tests/test_gui" --ignore="psychopy/tests/test_preferences" --ignore="psychopy/tests/test_experiment/needs_wx" --ignore="test_KeyboardComponent" -m "not needs_sound and not needs_wx and not emulator"  --cov=psychopy -W "ignore:Non-identical Builder Param:UserWarning" -v psychopy
+        fi
+
+    - name: upload failed app data
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: prefs_files_${{ matrix.os }}_${{ matrix.python-version }}
+        path: |
+          ~/.psychopy3
+          !~/.psychopy3/versions
+          !~/.psychopy3/fonts
+
+    - name: upload failed screenshots
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: failed_test_data_${{ github.run_id }}_${{ matrix.python-version }}_${{ matrix.os }}
+        path: |
+          psychopy/tests/fails
+          !**/*.mp4
+          !psychopy/tests/**/*.data
+          !**/*.wav
+
+    - name: Upload coverage to Codecov
+      if: always()
+      uses: codecov/codecov-action@v7
+      with:
+        fail_ci_if_error: false
